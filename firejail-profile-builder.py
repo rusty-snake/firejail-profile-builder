@@ -31,6 +31,7 @@ import typing
 class AccessKind(enum.Enum):
     """Possible access kinds"""
 
+    CREAT = enum.auto()
     EXEC = enum.auto()
     OPEN = enum.auto()
     STAT = enum.auto()
@@ -89,8 +90,8 @@ class FirejailProfileBuilder:
                     "--shell=none",
                     "--private",
                     "strace",
-                    "-e",
-                    "%file",
+                    "--trace=%file",
+                    "--signal=none",
                     "--quiet=all",
                     "--follow-forks",
                     "--output",
@@ -106,25 +107,31 @@ class FirejailProfileBuilder:
     @staticmethod
     def get_arg(args: str, n: int) -> str:
         """Extracts the nth argument from args."""
-        return args.split(",")[n].strip(' "')
+        return os.path.normpath(args.split(",")[n].strip(' "'))
 
     def parse_strace_output(self) -> None:
         """Parses strace output."""
         SYSCALL_ARGN_ACCESSKIND = {
+            "access": (0, AccessKind.STAT),
+            "chdir": (0, AccessKind.OPEN),
+            "chroot": (0, AccessKind.OPEN),
+            "execve": (0, AccessKind.EXEC),
+            "faccessat2": (1, AccessKind.STAT),
+            "mkdir": (0, AccessKind.CREAT),
+            "newfstatat": (1, AccessKind.STAT),
             "open": (0, AccessKind.OPEN),
             "openat": (1, AccessKind.OPEN),
-            "access": (0, AccessKind.STAT),
+            "readlink": (0, AccessKind.STAT),
             "stat": (0, AccessKind.STAT),
             "statfs": (0, AccessKind.STAT),
             "statx": (1, AccessKind.STAT),
-            "newfstatat": (1, AccessKind.STAT),
-            "execve": (0, AccessKind.EXEC),
         }
         assert self.strace_output is not None
         for line in self.strace_output.splitlines():
             parsed_line = re.match(r"\d+\s+(?P<syscall>\w+)\((?P<args>.*)\)", line)
             if not parsed_line:
-                raise NotImplementedError
+                print(f"firejail-profile-builder.py: Skipping strace_output {line=}")
+                continue
             syscall = parsed_line["syscall"]
             try:
                 arg_n, access_kind = SYSCALL_ARGN_ACCESSKIND[syscall]
@@ -295,15 +302,17 @@ class FirejailProfileBuilder:
         """Returns the whitelist"""
         whitelist = []
         for path in self.paths:
+            if "flatpak/exports" in path:
+                continue
             if path.startswith(self.home):
-                path = path.replace("${HOME}", self.home)
+                path = path.replace(self.home, "${HOME}")
                 if all(not path.startswith(p) for p in self.whitelist_common):
                     whitelist.append(f"whitelist {path}")
             elif path.startswith("/run"):
                 if all(not path.startswith(p) for p in self.whitelist_run_common):
                     whitelist.append(f"whitelist {path}")
             elif path.startswith(self.runuser):
-                path = path.replace("${RUNUSER}", self.runuser)
+                path = path.replace(self.runuser, "${RUNUSER}")
                 if all(not path.startswith(p) for p in self.whitelist_runuser_common):
                     whitelist.append(f"whitelist {path}")
             elif path.startswith("/usr/share"):
@@ -348,9 +357,9 @@ class FirejailProfileBuilder:
         """Returns all files accessed in /etc"""
         # TODO: Templates
         return ",".join(
-            os.path.basename(path)
+            path[len("/etc/") :]
             for path in self.paths.keys()
-            if path.startswith("/etc")
+            if path.startswith("/etc/")
         )
 
 
