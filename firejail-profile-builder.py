@@ -28,6 +28,38 @@ import tempfile
 import typing
 
 
+class WhitelistInc:
+    def __init__(self, path: str):
+        self.path = path
+        self._whitelist: typing.Optional[list[str]] = None
+
+    @property
+    def whitelist(self) -> list[str]:
+        if not self._whitelist:
+            with open(self.path) as raw_whitelist:
+                self._whitelist = [
+                    line[len("whitelist ") :].strip()
+                    for line in raw_whitelist
+                    if line.startswith("whitelist ")
+                ]
+        return self._whitelist
+
+    def __iter__(self) -> collections.abc.Iterator[str]:
+        return iter(self.whitelist)
+
+    def __contains__(self, path: str) -> bool:
+        return path in self.whitelist
+
+
+WHITELIST_COMMON = WhitelistInc("/etc/firejail/whitelist-common.inc")
+WHITELIST_RUN_COMMON = WhitelistInc("/etc/firejail/whitelist-run-common.inc")
+WHITELIST_RUNUSER_COMMON = WhitelistInc("/etc/firejail/whitelist-runuser-common.inc")
+WHITELIST_USR_SHARE_COMMON = WhitelistInc(
+    "/etc/firejail/whitelist-usr-share-common.inc"
+)
+WHITELIST_VAR_COMMON = WhitelistInc("/etc/firejail/whitelist-var-common.inc")
+
+
 class AccessKind(enum.Enum):
     """Possible access kinds"""
 
@@ -48,36 +80,6 @@ class FirejailProfileBuilder:
         self.paths: collections.defaultdict[
             str, set[AccessKind]
         ] = collections.defaultdict(set)
-        with open("/etc/firejail/whitelist-common.inc") as wc:
-            self.whitelist_common = [
-                line[len("whitelist ") :].strip()
-                for line in wc
-                if line.startswith("whitelist ")
-            ]
-        with open("/etc/firejail/whitelist-run-common.inc") as wrc:
-            self.whitelist_run_common = [
-                line[len("whitelist ") :].strip()
-                for line in wrc
-                if line.startswith("whitelist ")
-            ]
-        with open("/etc/firejail/whitelist-runuser-common.inc") as wruc:
-            self.whitelist_runuser_common = [
-                line[len("whitelist ") :].strip()
-                for line in wruc
-                if line.startswith("whitelist ")
-            ]
-        with open("/etc/firejail/whitelist-usr-share-common.inc") as wusc:
-            self.whitelist_usr_share_common = [
-                line[len("whitelist ") :].strip()
-                for line in wusc
-                if line.startswith("whitelist ")
-            ]
-        with open("/etc/firejail/whitelist-var-common.inc") as wvc:
-            self.whitelist_var_common = [
-                line[len("whitelist ") :].strip()
-                for line in wvc
-                if line.startswith("whitelist ")
-            ]
 
     def run_program(self) -> None:
         """Run the program with strace."""
@@ -306,20 +308,20 @@ class FirejailProfileBuilder:
                 continue
             if path.startswith(self.home):
                 path = path.replace(self.home, "${HOME}")
-                if all(not path.startswith(p) for p in self.whitelist_common):
+                if all(not path.startswith(p) for p in WHITELIST_COMMON):
                     whitelist.append(f"whitelist {path}")
             elif path.startswith("/run"):
-                if all(not path.startswith(p) for p in self.whitelist_run_common):
+                if all(not path.startswith(p) for p in WHITELIST_RUN_COMMON):
                     whitelist.append(f"whitelist {path}")
             elif path.startswith(self.runuser):
                 path = path.replace(self.runuser, "${RUNUSER}")
-                if all(not path.startswith(p) for p in self.whitelist_runuser_common):
+                if all(not path.startswith(p) for p in WHITELIST_RUNUSER_COMMON):
                     whitelist.append(f"whitelist {path}")
             elif path.startswith("/usr/share"):
-                if all(not path.startswith(p) for p in self.whitelist_usr_share_common):
+                if all(not path.startswith(p) for p in WHITELIST_USR_SHARE_COMMON):
                     whitelist.append(f"whitelist {path}")
             elif path.startswith("/var"):
-                if all(not path.startswith(p) for p in self.whitelist_var_common):
+                if all(not path.startswith(p) for p in WHITELIST_VAR_COMMON):
                     whitelist.append(f"whitelist {path}")
         whitelist.sort()
         return "\n".join(whitelist)
