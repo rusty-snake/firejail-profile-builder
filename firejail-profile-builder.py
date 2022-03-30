@@ -59,6 +59,26 @@ WHITELIST_USR_SHARE_COMMON = WhitelistInc(
 )
 WHITELIST_VAR_COMMON = WhitelistInc("/etc/firejail/whitelist-var-common.inc")
 
+MDWE_SYSCALLS = (
+    "mmap",
+    "mmap2",
+    "mprotect",
+    "pkey_mprotect",
+    "memfd_create",
+    "shmat",
+)
+
+
+class Protocol(enum.Enum):
+    """All protocols supported by firejail's protocol filter"""
+
+    AF_UNIX = 1
+    AF_INET = 2
+    AF_INET6 = 10
+    AF_NETLINK = 16
+    AF_PACKET = 17
+    AF_BLUETOOTH = 31
+
 
 class AccessKind(enum.Enum):
     """Possible access kinds"""
@@ -73,31 +93,44 @@ class FirejailProfileBuilder:
     def __init__(self, program: str, arguments: list[str]):
         self.program = program
         self.arguments = arguments
+
         self.home = str(pathlib.Path.home())
         self.runuser = f"/run/user/{os.getuid()}"
-        self.profile: typing.Optional[str] = None
+
         self.strace_output: typing.Optional[str] = None
         self.paths: collections.defaultdict[
             str, set[AccessKind]
         ] = collections.defaultdict(set)
 
+        self.profile: typing.Optional[str] = None
+
+        self.wx_mem = False
+        self.protocols: set[Protocol] = set()
+
     def run_program(self) -> None:
         """Run the program with strace."""
         with tempfile.NamedTemporaryFile() as tmpf:
+            firejail_cmd = [
+                "firejail",
+                "--quiet",
+                "--noprofile",
+                "--shell=none",
+                "--private",
+            ]
+            strace_cmd = [
+                "strace",
+                f"--trace=%file,socket,{','.join(MDWE_SYSCALLS)}",
+                "--quiet=all",
+                "--signal=none",
+                "--status=!unfinished",
+                "--follow-forks",
+                "--output",
+                tmpf.name,
+            ]
             subprocess.run(
                 [
-                    "firejail",
-                    "--quiet",
-                    "--noprofile",
-                    "--shell=none",
-                    "--private",
-                    "strace",
-                    "--trace=%file",
-                    "--signal=none",
-                    "--quiet=all",
-                    "--follow-forks",
-                    "--output",
-                    tmpf.name,
+                    *firejail_cmd,
+                    *strace_cmd,
                     "--",
                     self.program,
                     *self.arguments,
@@ -106,28 +139,65 @@ class FirejailProfileBuilder:
             )
             self.strace_output = tmpf.read().decode()
 
-    @staticmethod
-    def get_arg(args: str, n: int) -> str:
-        """Extracts the nth argument from args."""
-        return os.path.normpath(args.split(",")[n].strip(' "'))
+    def handle_socket_syscall(self, syscall: str, args: str) -> None:
+        """Handle socket syscall"""
+        if "AF_UNIX" in args:
+            self.protocols.add(Protocol.AF_UNIX)
+        elif "AF_INET6" in args:
+            self.protocols.add(Protocol.AF_INET6)
+        elif "AF_INET" in args:
+            self.protocols.add(Protocol.AF_INET)
+        elif "AF_NETLINK" in args:
+            self.protocols.add(Protocol.AF_NETLINK)
 
-    def parse_strace_output(self) -> None:
-        """Parses strace output."""
+    def handle_mdwe_syscalls(self, syscall: str, args: str) -> None:
+        """Handle mdwe syscalls"""
+        if self.wx_mem:
+            return
+
+        if syscall in ("mmap", "mmap2"):
+            self.wx_mem = "PROT_WRITE|PROT_EXEC" in args
+        elif syscall in ("mprotect", "pkey_mprotect"):
+            self.wx_mem = "PROT_EXEC" in args
+        elif syscall == "memfd_create":
+            self.wx_mem = True
+        elif syscall == "shmat":
+            self.wx_mem = "SHM_EXEC" in args
+
+    def handle_fs_syscalls(self, syscall: str, args: str) -> None:
+        """Handle %file syscalls"""
         SYSCALL_ARGN_ACCESSKIND = {
-            "access": (0, AccessKind.STAT),
+            # "access": (0, AccessKind.STAT),
             "chdir": (0, AccessKind.OPEN),
             "chroot": (0, AccessKind.OPEN),
             "execve": (0, AccessKind.EXEC),
-            "faccessat2": (1, AccessKind.STAT),
+            # "faccessat2": (1, AccessKind.STAT),
             "mkdir": (0, AccessKind.CREAT),
-            "newfstatat": (1, AccessKind.STAT),
+            # "newfstatat": (1, AccessKind.STAT),
             "open": (0, AccessKind.OPEN),
             "openat": (1, AccessKind.OPEN),
-            "readlink": (0, AccessKind.STAT),
-            "stat": (0, AccessKind.STAT),
-            "statfs": (0, AccessKind.STAT),
-            "statx": (1, AccessKind.STAT),
+            # "readlink": (0, AccessKind.STAT),
+            # "stat": (0, AccessKind.STAT),
+            # "statfs": (0, AccessKind.STAT),
+            # "statx": (1, AccessKind.STAT),
         }
+
+        get_arg: typing.Callable[[str, int], str] = lambda args, n: (
+            os.path.normpath(args.split(",")[n].strip(' "'))
+        )
+
+        try:
+            arg_n, access_kind = SYSCALL_ARGN_ACCESSKIND[syscall]
+        except KeyError:
+            print(
+                f"firejail-profile-builder.py: Not Implemented: {syscall=}",
+                file=sys.stderr,
+            )
+            return
+        self.paths[get_arg(args, arg_n)].add(access_kind)
+
+    def parse_strace_output(self) -> None:
+        """Parses strace output."""
         assert self.strace_output is not None
         for line in self.strace_output.splitlines():
             parsed_line = re.match(r"\d+\s+(?P<syscall>\w+)\((?P<args>.*)\)", line)
@@ -135,15 +205,14 @@ class FirejailProfileBuilder:
                 print(f"firejail-profile-builder.py: Skipping strace_output {line=}")
                 continue
             syscall = parsed_line["syscall"]
-            try:
-                arg_n, access_kind = SYSCALL_ARGN_ACCESSKIND[syscall]
-            except KeyError:
-                print(
-                    f"firejail-profile-builder.py: Not Implemented: {syscall=}",
-                    file=sys.stderr,
-                )
-                continue
-            self.paths[self.get_arg(parsed_line["args"], arg_n)].add(access_kind)
+            args = parsed_line["args"]
+
+            if syscall == "socket":
+                self.handle_socket_syscall(syscall, args)
+            elif syscall in MDWE_SYSCALLS:
+                self.handle_mdwe_syscalls(syscall, args)
+            else:
+                self.handle_fs_syscalls(syscall, args)
 
     def build(self) -> str:
         """Returns the profile for self.program and builds it if necessary."""
@@ -218,7 +287,7 @@ class FirejailProfileBuilder:
         caps.drop all
         #ipc-namespace
         #machine-id
-        #net none
+        {self.build_net_none()}
         netfilter
         no3d
         nodvd
@@ -231,9 +300,10 @@ class FirejailProfileBuilder:
         notv
         nou2f
         {self.build_novideo()}
-        protocol unix,inet,inet6,netlink
+        protocol {self.build_protocol()}
         seccomp
         seccomp.block-secondary
+        #seccomp.keep
         shell none
         tracelog
         ##x11 none
@@ -248,7 +318,7 @@ class FirejailProfileBuilder:
         #dbus-user none
         dbus-system none
 
-        #memory-deny-write-execute
+        {self.build_memory_deny_write_execute()}
         #read-only ${{HOME}}
         """.replace(
             "\n        ", "\n"
@@ -326,11 +396,30 @@ class FirejailProfileBuilder:
         whitelist.sort()
         return "\n".join(whitelist)
 
+    def build_net_none(self) -> str:
+        """Returns net none if possible"""
+        if Protocol.AF_INET in self.protocols:
+            return "# Uncomment to disable network access.\n#net none"
+        return "net none"
+
     def build_novideo(self) -> str:
         """Returns 'novideo' if possible"""
         if any(path.startswith("/dev/video") for path in self.paths):
             return "# Uncomment to disable video devices.\n#novideo"
         return "novideo"
+
+    def build_protocol(self) -> str:
+        """Returns all used protocols"""
+        protocol = ""
+        if Protocol.AF_UNIX in self.protocols:
+            protocol += "unix,"
+        if Protocol.AF_INET in self.protocols:
+            protocol += "inet,"
+        if Protocol.AF_INET6 in self.protocols:
+            protocol += "inet6,"
+        if Protocol.AF_NETLINK in self.protocols:
+            protocol += "netlink,"
+        return protocol[:-1]
 
     def build_disable_mnt(self) -> str:
         """Returns 'disable-mnt' if possible"""
@@ -340,7 +429,9 @@ class FirejailProfileBuilder:
         )
         if any(is_mnt(path) for path in self.paths):
             return "disable-mnt"
-        return "#disable-mnt"
+        return (
+            "# Uncomment to blacklist /mnt, /run/mnt, /media, /run/media.\n#disable-mnt"
+        )
 
     def build_private_bin(self) -> str:
         """Returns all files accessed in {/usr,}/{s,}bin"""
@@ -358,11 +449,21 @@ class FirejailProfileBuilder:
     def build_private_etc(self) -> str:
         """Returns all files accessed in /etc"""
         # TODO: Templates
-        return ",".join(
+        files = [
             path[len("/etc/") :]
             for path in self.paths.keys()
             if path.startswith("/etc/")
+        ]
+        cleaned_files = sorted(
+            file
+            for file in files
+            if all(not file.startswith(f) for f in files if f != file)
         )
+        return ",".join(cleaned_files)
+
+    def build_memory_deny_write_execute(self) -> str:
+        """Returns memory-deny-write-execute if possible"""
+        return "" if self.wx_mem else "memory-deny-write-execute"
 
 
 if __name__ == "__main__":
@@ -380,6 +481,7 @@ if __name__ == "__main__":
             action="store_true",
             help="Overwrite output file if it exists.",
         )
+        # parser.add_argument("--firejail-cmd")
         parser.add_argument("program")
         parser.add_argument("arguments", nargs=argparse.REMAINDER)
         args = parser.parse_args()
