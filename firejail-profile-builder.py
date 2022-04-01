@@ -16,22 +16,46 @@
 # PERFORMANCE OF THIS SOFTWARE.
 
 import argparse
-import collections
 import enum
 import os
 import os.path
-import pathlib
 import re
 import subprocess
 import sys
 import tempfile
-import typing
+from collections import defaultdict
+from collections.abc import Iterator
+from typing import Callable, Optional
+from pathlib import Path
+
+
+class BlacklistInc:
+    def __init__(self, path: str):
+        self.path = path
+        self._blacklist: Optional[list[str]] = None
+
+    @property
+    def blacklist(self) -> list[str]:
+        if not self._blacklist:
+            with open(self.path) as raw_blacklist:
+                self._blacklist = [
+                    line[len("blacklist ") :].strip()
+                    for line in raw_blacklist
+                    if line.startswith("blacklist ")
+                ]
+        return self._blacklist
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self.blacklist)
+
+    def __contains__(self, path: str) -> bool:
+        return path in self.blacklist
 
 
 class WhitelistInc:
     def __init__(self, path: str):
         self.path = path
-        self._whitelist: typing.Optional[list[str]] = None
+        self._whitelist: Optional[list[str]] = None
 
     @property
     def whitelist(self) -> list[str]:
@@ -44,7 +68,7 @@ class WhitelistInc:
                 ]
         return self._whitelist
 
-    def __iter__(self) -> collections.abc.Iterator[str]:
+    def __iter__(self) -> Iterator[str]:
         return iter(self.whitelist)
 
     def __contains__(self, path: str) -> bool:
@@ -59,6 +83,9 @@ WHITELIST_USR_SHARE_COMMON = WhitelistInc(
 )
 WHITELIST_VAR_COMMON = WhitelistInc("/etc/firejail/whitelist-var-common.inc")
 
+DISABLE_COMMON = BlacklistInc("/etc/firejail/disable-common.inc")
+DISABLE_PROGRAMS = BlacklistInc("/etc/firejail/disable-programs.inc")
+
 MDWE_SYSCALLS = (
     "mmap",
     "mmap2",
@@ -67,6 +94,9 @@ MDWE_SYSCALLS = (
     "memfd_create",
     "shmat",
 )
+
+HOME = Path.home()
+RUNUSER = Path(f"/run/user/{os.getuid()}")
 
 
 class Protocol(enum.Enum):
@@ -94,18 +124,17 @@ class FirejailProfileBuilder:
         self.program = program
         self.arguments = arguments
 
-        self.home = str(pathlib.Path.home())
-        self.runuser = f"/run/user/{os.getuid()}"
+        self.strace_output: Optional[str] = None
+        self.paths: defaultdict[
+            Path, set[AccessKind]
+        ] = defaultdict(set)
 
-        self.strace_output: typing.Optional[str] = None
-        self.paths: collections.defaultdict[
-            str, set[AccessKind]
-        ] = collections.defaultdict(set)
+        self.profile: Optional[str] = None
 
-        self.profile: typing.Optional[str] = None
-
-        self.wx_mem = False
+        self.called_chroot = False
+        self.printers = False
         self.protocols: set[Protocol] = set()
+        self.wx_mem = False
 
     def run_program(self) -> None:
         """Run the program with strace."""
@@ -119,7 +148,7 @@ class FirejailProfileBuilder:
             ]
             strace_cmd = [
                 "strace",
-                f"--trace=%file,socket,{','.join(MDWE_SYSCALLS)}",
+                f"--trace=%file,socket,connect,{','.join(MDWE_SYSCALLS)}",
                 "--quiet=all",
                 "--signal=none",
                 "--status=!unfinished",
@@ -149,6 +178,11 @@ class FirejailProfileBuilder:
             self.protocols.add(Protocol.AF_INET)
         elif "AF_NETLINK" in args:
             self.protocols.add(Protocol.AF_NETLINK)
+
+    def handle_connect_syscall(self, syscall: str, args: str) -> None:
+        """Handle connect syscall"""
+        if '{sa_family=AF_UNIX, sun_path="/run/cups/cups.sock"}' in args:
+            self.printers = True
 
     def handle_mdwe_syscalls(self, syscall: str, args: str) -> None:
         """Handle mdwe syscalls"""
@@ -182,9 +216,12 @@ class FirejailProfileBuilder:
             # "statx": (1, AccessKind.STAT),
         }
 
-        get_arg: typing.Callable[[str, int], str] = lambda args, n: (
+        get_path: Callable[[str, int], str] = lambda args, n: (
             os.path.normpath(args.split(",")[n].strip(' "'))
         )
+
+        if syscall == "chroot":
+            self.called_chroot = True
 
         try:
             arg_n, access_kind = SYSCALL_ARGN_ACCESSKIND[syscall]
@@ -194,7 +231,7 @@ class FirejailProfileBuilder:
                 file=sys.stderr,
             )
             return
-        self.paths[get_arg(args, arg_n)].add(access_kind)
+        self.paths[Path(get_path(args, arg_n))].add(access_kind)
 
     def parse_strace_output(self) -> None:
         """Parses strace output."""
@@ -209,6 +246,8 @@ class FirejailProfileBuilder:
 
             if syscall == "socket":
                 self.handle_socket_syscall(syscall, args)
+            elif syscall == "connect":
+                self.handle_connect_syscall(syscall, args)
             elif syscall in MDWE_SYSCALLS:
                 self.handle_mdwe_syscalls(syscall, args)
             else:
@@ -232,7 +271,7 @@ class FirejailProfileBuilder:
         {self.build_ignore_noexec_home()}
         {self.build_ignore_noexec_tmp()}
 
-        #noblacklist PATH
+        {self.build_noblacklist()}
 
         # Allow /bin/sh (blacklisted by disable-shell.inc)
         #include allow-bin-sh.inc
@@ -294,14 +333,14 @@ class FirejailProfileBuilder:
         nogroups
         noinput
         nonewprivs
-        noprinters
+        {self.build_noprinters()}
         noroot
         #nosound
         notv
         nou2f
         {self.build_novideo()}
         protocol {self.build_protocol()}
-        seccomp
+        {self.build_seccomp()}
         seccomp.block-secondary
         #seccomp.keep
         shell none
@@ -331,7 +370,7 @@ class FirejailProfileBuilder:
         if any(
             AccessKind.EXEC in access_kinds
             for path, access_kinds in self.paths.items()
-            if path.startswith(self.home)
+            if HOME in path.parents
         ):
             return "ignore noexec ${HOME}"
         return "# Uncomment to allow executing programs in ${HOME}.\n#ignore noexec ${HOME}"
@@ -341,16 +380,24 @@ class FirejailProfileBuilder:
         if any(
             AccessKind.EXEC in access_kinds
             for path, access_kinds in self.paths.items()
-            if path.startswith("/tmp")
+            #if os.path.commonpath(["/tmp", path]) == "/tmp"
+            if Path("/tmp") in path.parents
         ):
             return "ignore noexec /tmp"
         return "# Uncomment to allow executing programs in /tmp.\n#ignore noexec /tmp"
+
+    def build_noblacklist(self) -> str:
+        pass
+        #for path in paths:
+            #if (path or parents) in DISABLE_COMMON | DISABLE_PROGRAMS:
+                #noblacklist {blacklist}
 
     def build_allow_python(self) -> str:
         """Returns allow-python?.inc if needed"""
         # TODO: Allow python2 only if necessary
         if any(
-            path.startswith("/usr/bin/python") and AccessKind.EXEC in access_kinds
+            # str(path).startswith("/usr/bin/python") and ...
+            path.parent == Path("/usr/bin") and path.name.startswith("python") and AccessKind.EXEC in access_kinds
             for path, access_kinds in self.paths.items()
         ):
             return (
@@ -366,7 +413,7 @@ class FirejailProfileBuilder:
 
     def build_blacklist_libexec(self) -> str:
         """Returns 'blacklist /usr/libexec' if possible"""
-        if any(path.startswith("/usr/libexec") for path in self.paths):
+        if any(Path("/usr/libexec") in path.parents for path in self.paths):
             return ""
         return "blacklist /usr/libexec"
 
@@ -374,24 +421,24 @@ class FirejailProfileBuilder:
         """Returns the whitelist"""
         whitelist = []
         for path in self.paths:
-            if "flatpak/exports" in path:
+            if "flatpak/exports" in str(path):
                 continue
-            if path.startswith(self.home):
-                path = path.replace(self.home, "${HOME}")
-                if all(not path.startswith(p) for p in WHITELIST_COMMON):
+            if HOME in path.parents:
+                spath = str(path).replace(str(HOME), "${HOME}")
+                if all(not spath.startswith(p) for p in WHITELIST_COMMON):
+                    whitelist.append(f"whitelist {spath}")
+            elif Path("/run") in path.parents:
+                if all(p not in map(str, path.parents) for p in WHITELIST_RUN_COMMON):
                     whitelist.append(f"whitelist {path}")
-            elif path.startswith("/run"):
-                if all(not path.startswith(p) for p in WHITELIST_RUN_COMMON):
+            elif RUNUSER in path.parents:
+                spath = str(path).replace(str(RUNUSER), "${RUNUSER}")
+                if all(not spath.startswith(p) for p in WHITELIST_RUNUSER_COMMON):
+                    whitelist.append(f"whitelist {spath}")
+            elif Path("/usr/share") in path.parents:
+                if all(p not in map(str, path.parents) for p in WHITELIST_USR_SHARE_COMMON):
                     whitelist.append(f"whitelist {path}")
-            elif path.startswith(self.runuser):
-                path = path.replace(self.runuser, "${RUNUSER}")
-                if all(not path.startswith(p) for p in WHITELIST_RUNUSER_COMMON):
-                    whitelist.append(f"whitelist {path}")
-            elif path.startswith("/usr/share"):
-                if all(not path.startswith(p) for p in WHITELIST_USR_SHARE_COMMON):
-                    whitelist.append(f"whitelist {path}")
-            elif path.startswith("/var"):
-                if all(not path.startswith(p) for p in WHITELIST_VAR_COMMON):
+            elif Path("/var") in path.parents:
+                if all(p not in map(str, path.parents) for p in WHITELIST_VAR_COMMON):
                     whitelist.append(f"whitelist {path}")
         whitelist.sort()
         return "\n".join(whitelist)
@@ -402,9 +449,12 @@ class FirejailProfileBuilder:
             return "# Uncomment to disable network access.\n#net none"
         return "net none"
 
+    def build_noprinters(self) -> str:
+        return "#noprinters" if self.printers else "noprinters"
+
     def build_novideo(self) -> str:
         """Returns 'novideo' if possible"""
-        if any(path.startswith("/dev/video") for path in self.paths):
+        if any(str(path).startswith("/dev/video") for path in self.paths):
             return "# Uncomment to disable video devices.\n#novideo"
         return "novideo"
 
@@ -421,10 +471,13 @@ class FirejailProfileBuilder:
             protocol += "netlink,"
         return protocol[:-1]
 
+    def build_seccomp(self) -> str:
+        return "seccomp !chroot" if self.called_chroot else "seccomp"
+
     def build_disable_mnt(self) -> str:
         """Returns 'disable-mnt' if possible"""
-        is_mnt: typing.Callable[[str], bool] = lambda path: any(
-            path.startswith(mnt_prefix)
+        is_mnt: Callable[[Path], bool] = lambda path: any(
+            Path(mnt_prefix) in path.parents
             for mnt_prefix in ["/mnt", "/run/mnt", "/media", "/run/media"]
         )
         if any(is_mnt(path) for path in self.paths):
@@ -436,8 +489,8 @@ class FirejailProfileBuilder:
     def build_private_bin(self) -> str:
         """Returns all files accessed in {/usr,}/{s,}bin"""
         # TODO: python3.8 -> python3*
-        is_bindir: typing.Callable[[str], bool] = lambda path: any(
-            path.startswith(bin_prefix)
+        is_bindir: Callable[[Path], bool] = lambda path: any(
+            Path(bin_prefix) in path.parents
             for bin_prefix in ["/bin", "/sbin", "/usr/bin", "/usr/sbin"]
         )
         return ",".join(
@@ -450,9 +503,9 @@ class FirejailProfileBuilder:
         """Returns all files accessed in /etc"""
         # TODO: Templates
         files = [
-            path[len("/etc/") :]
+            str(path)[len("/etc/") :]
             for path in self.paths.keys()
-            if path.startswith("/etc/")
+            if Path("/etc") in path.parents
         ]
         cleaned_files = sorted(
             file
