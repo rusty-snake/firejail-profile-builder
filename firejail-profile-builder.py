@@ -372,8 +372,7 @@ class FirejailProfileBuilder:
 
         {self.build_noblacklist()}
 
-        # Allow /bin/sh (blacklisted by disable-shell.inc)
-        #include allow-bin-sh.inc
+        {self.build_allow_bin_sh()}
 
         # Allows files commonly used by IDEs
         #include allow-common-devel.inc
@@ -504,6 +503,26 @@ class FirejailProfileBuilder:
                     )
                     noblacklist.add(f"noblacklist {sparent}")
         return "\n".join(sorted(noblacklist))
+
+    def build_allow_bin_sh(self) -> str:
+        """Retruns allow-bin-sh.inc if needed"""
+        bin_shs = [
+            "/bin/sh",
+            "/usr/bin/sh",
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/bin/dash",
+            "/usr/bin/dash",
+        ]
+        if any(Path(bin_sh) in self.paths for bin_sh in bin_shs):
+            return (
+                "# Allow /bin/sh (blacklisted by disable-shell.inc)\n"
+                "include allow-bin-sh.inc"
+            )
+        return (
+            "# Allow /bin/sh (blacklisted by disable-shell.inc)\n"
+            "#include allow-bin-sh.inc"
+        )
 
     def build_allow_python(self) -> str:
         """Returns allow-python?.inc if needed"""
